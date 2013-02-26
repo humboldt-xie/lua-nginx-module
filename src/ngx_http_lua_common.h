@@ -1,7 +1,13 @@
-/* vim:set ft=c ts=4 sw=4 et fdm=marker: */
 
-#ifndef NGX_HTTP_LUA_COMMON_H
-#define NGX_HTTP_LUA_COMMON_H
+/*
+ * Copyright (C) Xiaozhe Wang (chaoslawful)
+ * Copyright (C) Yichun Zhang (agentzh)
+ */
+
+
+#ifndef _NGX_HTTP_LUA_COMMON_H_INCLUDED_
+#define _NGX_HTTP_LUA_COMMON_H_INCLUDED_
+
 
 #include <nginx.h>
 #include <ngx_core.h>
@@ -303,6 +309,8 @@ typedef struct ngx_http_lua_ctx_s {
     ngx_chain_t             *body; /* buffered subrequest response body
                                       chains */
 
+    ngx_chain_t            **last_body; /* for the "body" field */
+
     ngx_str_t                exec_uri;
     ngx_str_t                exec_args;
 
@@ -357,6 +365,8 @@ typedef struct ngx_http_lua_ctx_s {
 
     unsigned         no_abort:1; /* prohibit "world abortion" via ngx.exit()
                                     and etc */
+
+    unsigned         seen_last_in_filter:1;  /* used by body_filter_by_lua* */
 } ngx_http_lua_ctx_t;
 
 
@@ -390,5 +400,6 @@ extern ngx_http_output_header_filter_pt ngx_http_lua_next_header_filter;
 extern ngx_http_output_body_filter_pt ngx_http_lua_next_body_filter;
 
 
-#endif /* NGX_HTTP_LUA_COMMON_H */
+#endif /* _NGX_HTTP_LUA_COMMON_H_INCLUDED_ */
 
+/* vi:set ft=c ts=4 sw=4 et fdm=marker: */

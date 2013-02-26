@@ -1,4 +1,9 @@
-/* vim:set ft=c ts=4 sw=4 et fdm=marker: */
+
+/*
+ * Copyright (C) Xiaozhe Wang (chaoslawful)
+ * Copyright (C) Yichun Zhang (agentzh)
+ */
+
 
 #ifndef DDEBUG
 #define DDEBUG 0
@@ -795,17 +800,11 @@ ngx_http_lua_discard_bufs(ngx_pool_t *pool, ngx_chain_t *in)
 
 ngx_int_t
 ngx_http_lua_add_copy_chain(ngx_http_request_t *r, ngx_http_lua_ctx_t *ctx,
-    ngx_chain_t **chain, ngx_chain_t *in)
+    ngx_chain_t ***plast, ngx_chain_t *in)
 {
-    ngx_chain_t     *cl, **ll;
+    ngx_chain_t     *cl;
     size_t           len;
     ngx_buf_t       *b;
-
-    ll = chain;
-
-    for (cl = *chain; cl; cl = cl->next) {
-        ll = &cl->next;
-    }
 
     len = 0;
 
@@ -835,13 +834,14 @@ ngx_http_lua_add_copy_chain(ngx_http_request_t *r, ngx_http_lua_ctx_t *ctx,
     while (in) {
         if (ngx_buf_in_memory(in->buf)) {
             b->last = ngx_copy(b->last, in->buf->pos,
-                    in->buf->last - in->buf->pos);
+                               in->buf->last - in->buf->pos);
         }
 
         in = in->next;
     }
 
-    *ll = cl;
+    **plast = cl;
+    *plast = &cl->next;
 
     return NGX_OK;
 }
@@ -970,7 +970,7 @@ ngx_int_t
 ngx_http_lua_run_thread(lua_State *L, ngx_http_request_t *r,
     ngx_http_lua_ctx_t *ctx, int nret)
 {
-    ngx_http_lua_co_ctx_t   *next_coctx, *parent_coctx;
+    ngx_http_lua_co_ctx_t   *next_coctx, *parent_coctx, *orig_coctx;
     int                      rv, nrets, success = 1;
     lua_State               *next_co;
     lua_State               *old_co;
@@ -980,8 +980,9 @@ ngx_http_lua_run_thread(lua_State *L, ngx_http_request_t *r,
     ngx_pool_t              *old_pool = NULL;
 #endif
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "lua run thread, top:%d", lua_gettop(L));
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "lua run thread, top:%d c:%ud", lua_gettop(L),
+                   r->main->count);
 
     /* set Lua VM panic handler */
     lua_atpanic(L, ngx_http_lua_atpanic);
@@ -1014,7 +1015,8 @@ ngx_http_lua_run_thread(lua_State *L, ngx_http_request_t *r,
             dd("ctx: %p", ctx);
             dd("cur co: %p", ctx->cur_co_ctx->co);
 
-            rv = lua_resume(ctx->cur_co_ctx->co, nrets);
+            orig_coctx = ctx->cur_co_ctx;
+            rv = lua_resume(orig_coctx->co, nrets);
 
 #if (NGX_PCRE)
             /* XXX: work-around to nginx regex subsystem */
@@ -1294,6 +1296,10 @@ user_co_done:
             default:
                 err = "unknown error";
                 break;
+            }
+
+            if (ctx->cur_co_ctx != orig_coctx) {
+                ctx->cur_co_ctx = orig_coctx;
             }
 
             if (lua_isstring(ctx->cur_co_ctx->co, -1)) {
@@ -3175,6 +3181,9 @@ ngx_http_lua_rd_check_broken_connection(ngx_http_request_t *r)
 
     if (ctx->entered_content_phase) {
         r->write_event_handler = ngx_http_lua_content_wev_handler;
+
+    } else {
+        r->write_event_handler = ngx_http_core_run_phases;
     }
 
     r->write_event_handler(r);
@@ -3270,3 +3279,5 @@ ngx_http_lua_test_expect(ngx_http_request_t *r)
 
     return NGX_ERROR;
 }
+
+/* vi:set ft=c ts=4 sw=4 et fdm=marker: */

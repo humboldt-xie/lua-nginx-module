@@ -1,7 +1,14 @@
+
+/*
+ * Copyright (C) Yichun Zhang (agentzh)
+ */
+
+
 #ifndef DDEBUG
 #define DDEBUG 0
 #endif
 #include "ddebug.h"
+
 
 #if (NGX_PCRE)
 
@@ -30,6 +37,7 @@
 #define NGX_LUA_RE_COMPILE_ONCE      (1<<0)
 #define NGX_LUA_RE_MODE_DFA          (1<<1)
 #define NGX_LUA_RE_MODE_JIT          (1<<2)
+#define NGX_LUA_RE_MODE_DUPNAMES     (1<<3)
 
 #define NGX_LUA_RE_DFA_MODE_WORKSPACE_COUNT (100)
 
@@ -69,7 +77,7 @@ typedef struct {
 
 static int ngx_http_lua_ngx_re_gmatch_iterator(lua_State *L);
 static ngx_uint_t ngx_http_lua_ngx_re_parse_opts(lua_State *L,
-        ngx_lua_regex_compile_t *re, ngx_str_t *opts, int narg);
+    ngx_lua_regex_compile_t *re, ngx_str_t *opts, int narg);
 static int ngx_http_lua_ngx_re_sub_helper(lua_State *L, unsigned global);
 static int ngx_http_lua_ngx_re_match(lua_State *L);
 static int ngx_http_lua_ngx_re_gmatch(lua_State *L);
@@ -80,17 +88,20 @@ static void ngx_http_lua_regex_free_study_data(ngx_pool_t *pool,
 static ngx_int_t ngx_lua_regex_compile(ngx_lua_regex_compile_t *rc);
 static void ngx_http_lua_ngx_re_gmatch_cleanup(void *data);
 static int ngx_http_lua_ngx_re_gmatch_gc(lua_State *L);
+static void ngx_http_lua_re_collect_named_captures(lua_State *L,
+    u_char *name_table, int name_count, int name_entry_size,
+    unsigned flags, ngx_str_t *subj);
 
 
-#define ngx_http_lua_regex_exec(re, e, s, start, captures, size) \
-    pcre_exec(re, e, (const char *) (s)->data, (s)->len, start, 0, \
+#define ngx_http_lua_regex_exec(re, e, s, start, captures, size)             \
+    pcre_exec(re, e, (const char *) (s)->data, (s)->len, start, 0,           \
               captures, size)
 
 
-#define ngx_http_lua_regex_dfa_exec(re, e, s, start, captures, size, ws, \
-        wscount) \
-    pcre_dfa_exec(re, e, (const char *) (s)->data, (s)->len, start, 0, \
-              captures, size, ws, wscount)
+#define ngx_http_lua_regex_dfa_exec(re, e, s, start, captures, size, ws,     \
+                                    wscount)                                 \
+    pcre_dfa_exec(re, e, (const char *) (s)->data, (s)->len, start, 0,       \
+                  captures, size, ws, wscount)
 
 
 static int
@@ -116,12 +127,14 @@ ngx_http_lua_ngx_re_match(lua_State *L)
     ngx_http_lua_main_conf_t    *lmcf = NULL;
     u_char                       errstr[NGX_MAX_CONF_ERRSTR + 1];
     pcre_extra                  *sd = NULL;
+    int                          name_entry_size, name_count;
+    u_char                      *name_table;
 
     nargs = lua_gettop(L);
 
     if (nargs != 2 && nargs != 3 && nargs != 4) {
         return luaL_error(L, "expecting two or three or four arguments, "
-                "but got %d", nargs);
+                          "but got %d", nargs);
     }
 
     lua_pushlightuserdata(L, &ngx_http_lua_request_key);
@@ -155,8 +168,7 @@ ngx_http_lua_ngx_re_match(lua_State *L)
 
             } else {
                 msg = lua_pushfstring(L, "bad pos field type in the ctx table "
-                        "argument: %s",
-                        luaL_typename(L, -1));
+                                      "argument: %s", luaL_typename(L, -1));
 
                 return luaL_argerror(L, 4, msg);
             }
@@ -194,7 +206,7 @@ ngx_http_lua_ngx_re_match(lua_State *L)
         lua_pushvalue(L, -1); /* table key key */
 
         dd("regex cache key: %.*s", (int) (pat.len + sizeof(re_comp.options)),
-                lua_tostring(L, -1));
+           lua_tostring(L, -1));
 
         lua_rawget(L, -3); /* table key re */
         re = lua_touserdata(L, -1);
@@ -203,13 +215,13 @@ ngx_http_lua_ngx_re_match(lua_State *L)
 
         if (re) {
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                    "lua regex cache hit for match regex \"%s\" with "
-                    "options \"%s\"", pat.data, opts.data);
+                           "lua regex cache hit for match regex \"%s\" with "
+                           "options \"%s\"", pat.data, opts.data);
 
             lua_pop(L, 2);
 
             dd("restoring regex %p, ncaptures %d,  captures %p", re->regex,
-                    re->ncaptures, re->captures);
+               re->ncaptures, re->captures);
 
             re_comp.regex = re->regex;
             sd = re->regex_sd;
@@ -227,15 +239,15 @@ ngx_http_lua_ngx_re_match(lua_State *L)
         }
 
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "lua regex cache miss for match regex \"%s\" "
-                "with options \"%s\"", pat.data, opts.data);
+                       "lua regex cache miss for match regex \"%s\" "
+                       "with options \"%s\"", pat.data, opts.data);
 
         if (lmcf->regex_cache_entries >= lmcf->regex_cache_max_entries) {
 
             if (lmcf->regex_cache_entries == lmcf->regex_cache_max_entries) {
                 ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                        "lua exceeding regex cache max entries (%i)",
-                        lmcf->regex_cache_max_entries);
+                              "lua exceeding regex cache max entries (%i)",
+                              lmcf->regex_cache_max_entries);
 
                 lmcf->regex_cache_entries++;
             }
@@ -256,12 +268,12 @@ ngx_http_lua_ngx_re_match(lua_State *L)
     re_comp.pool = pool;
 
     ngx_log_debug5(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-            "lua compiling match regex \"%s\" with options \"%s\" "
-            "(compile once: %d) (dfa mode: %d) (jit mode: %d)",
-            pat.data, opts.data,
-            (flags & NGX_LUA_RE_COMPILE_ONCE) != 0,
-            (flags & NGX_LUA_RE_MODE_DFA) != 0,
-            (flags & NGX_LUA_RE_MODE_JIT) != 0);
+                   "lua compiling match regex \"%s\" with options \"%s\" "
+                   "(compile once: %d) (dfa mode: %d) (jit mode: %d)",
+                   pat.data, opts.data,
+                   (flags & NGX_LUA_RE_COMPILE_ONCE) != 0,
+                   (flags & NGX_LUA_RE_MODE_DFA) != 0,
+                   (flags & NGX_LUA_RE_MODE_JIT) != 0);
 
     old_pool = ngx_http_lua_pcre_malloc_init(pool);
 
@@ -274,7 +286,7 @@ ngx_http_lua_ngx_re_match(lua_State *L)
 
         re_comp.err.data[re_comp.err.len] = '\0';
         msg = lua_pushfstring(L, "failed to compile regex \"%s\": %s",
-                pat.data, re_comp.err.data);
+                              pat.data, re_comp.err.data);
 
         return luaL_argerror(L, 2, msg);
     }
@@ -294,8 +306,8 @@ ngx_http_lua_ngx_re_match(lua_State *L)
 
         if (msg != NULL) {
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "pcre study failed with PCRE_STUDY_JIT_COMPILE: %s (%p)",
-                msg, sd);
+                           "pcre study failed with PCRE_STUDY_JIT_COMPILE: "
+                           "%s (%p)", msg, sd);
         }
 
         if (sd != NULL) {
@@ -308,7 +320,7 @@ ngx_http_lua_ngx_re_match(lua_State *L)
             ngx_http_lua_pcre_malloc_done(old_pool);
 
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "pcre JIT compiling result: %d", jitted);
+                           "pcre JIT compiling result: %d", jitted);
         }
 #   endif /* !(NGX_DEBUG) */
 
@@ -362,9 +374,9 @@ ngx_http_lua_ngx_re_match(lua_State *L)
     if (flags & NGX_LUA_RE_COMPILE_ONCE) {
 
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "lua saving compiled regex (%d captures) into the cache "
-                "(entries %i)", re_comp.captures,
-                 lmcf ? lmcf->regex_cache_entries : 0);
+                       "lua saving compiled regex (%d captures) into the cache "
+                       "(entries %i)", re_comp.captures,
+                       lmcf ? lmcf->regex_cache_entries : 0);
 
         re = ngx_palloc(pool, sizeof(ngx_http_lua_regex_t));
         if (re == NULL) {
@@ -390,13 +402,37 @@ ngx_http_lua_ngx_re_match(lua_State *L)
     }
 
 exec:
+    if (pcre_fullinfo(re_comp.regex, NULL, PCRE_INFO_NAMECOUNT,
+                      &name_count) != 0)
+    {
+        msg = "cannot acquire named subpattern count";
+        goto error;
+    }
+
+    if (name_count > 0) {
+        if (pcre_fullinfo(re_comp.regex, NULL, PCRE_INFO_NAMEENTRYSIZE,
+                          &name_entry_size) != 0)
+        {
+            msg = "cannot acquire named subpattern entry size";
+            goto error;
+        }
+
+        if (pcre_fullinfo(re_comp.regex, NULL, PCRE_INFO_NAMETABLE,
+                          &name_table) != 0)
+        {
+            msg = "cannot acquire named subpattern table";
+            goto error;
+        }
+    }
+
     if (flags & NGX_LUA_RE_MODE_DFA) {
 
 #if LUA_HAVE_PCRE_DFA
 
         int ws[NGX_LUA_RE_DFA_MODE_WORKSPACE_COUNT];
         rc = ngx_http_lua_regex_dfa_exec(re_comp.regex, sd, &subj,
-            (int) pos, cap, ovecsize, ws, NGX_LUA_RE_DFA_MODE_WORKSPACE_COUNT);
+                                         (int) pos, cap, ovecsize, ws,
+                                         sizeof(ws)/sizeof(ws[0]));
 
 #else /* LUA_HAVE_PCRE_DFA */
 
@@ -407,13 +443,13 @@ exec:
 
     } else {
         rc = ngx_http_lua_regex_exec(re_comp.regex, sd, &subj, (int) pos, cap,
-                ovecsize);
+                                     ovecsize);
     }
 
     if (rc == NGX_REGEX_NO_MATCHED) {
         ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "regex \"%s\" not matched on string \"%s\" starting from %z",
-                pat.data, subj.data, pos);
+                       "regex \"%V\" not matched on string \"%V\" starting "
+                       "from %i", &pat, &subj, pos);
 
         if (!(flags & NGX_LUA_RE_COMPILE_ONCE)) {
             if (sd) {
@@ -430,7 +466,7 @@ exec:
 
     if (rc < 0) {
         msg = lua_pushfstring(L, ngx_regex_exec_n " failed: %d on \"%s\" "
-            "using \"%s\"", (int) rc, subj.data, pat.data);
+                              "using \"%s\"", (int) rc, subj.data, pat.data);
         goto error;
     }
 
@@ -455,12 +491,17 @@ exec:
 
         } else {
             lua_pushlstring(L, (char *) &subj.data[cap[n]],
-                    cap[n + 1] - cap[n]);
+                            cap[n + 1] - cap[n]);
 
             dd("pushing capture %s at %d", lua_tostring(L, -1), (int) i);
         }
 
         lua_rawseti(L, -2, (int) i);
+    }
+
+    if (name_count > 0) {
+        ngx_http_lua_re_collect_named_captures(L, name_table, name_count,
+                                               name_entry_size, flags, &subj);
     }
 
     if (nargs == 4) { /* having ctx table */
@@ -571,13 +612,13 @@ ngx_http_lua_ngx_re_gmatch(lua_State *L)
         dd("options size: %d", (int) sizeof(re_comp.options));
 
         lua_pushlstring(L, (char *) &re_comp.options,
-                sizeof(re_comp.options)); /* table regex opts */
+                        sizeof(re_comp.options)); /* table regex opts */
 
         lua_concat(L, 3); /* table key */
         lua_pushvalue(L, -1); /* table key key */
 
         dd("regex cache key: %.*s", (int) (pat.len + sizeof(re_comp.options)),
-                lua_tostring(L, -1));
+           lua_tostring(L, -1));
 
         lua_rawget(L, -3); /* table key re */
         re = lua_touserdata(L, -1);
@@ -586,13 +627,13 @@ ngx_http_lua_ngx_re_gmatch(lua_State *L)
 
         if (re) {
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                    "lua regex cache hit for match regex \"%s\" "
-                    "with options \"%s\"", pat.data, opts.data);
+                           "lua regex cache hit for match regex \"%s\" "
+                           "with options \"%s\"", pat.data, opts.data);
 
             lua_pop(L, 2);
 
             dd("restoring regex %p, ncaptures %d,  captures %p", re->regex,
-                    re->ncaptures, re->captures);
+               re->ncaptures, re->captures);
 
             re_comp.regex = re->regex;
             sd = re->regex_sd;
@@ -610,15 +651,15 @@ ngx_http_lua_ngx_re_gmatch(lua_State *L)
         }
 
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "lua regex cache miss for match regex \"%s\" "
-                "with options \"%s\"", pat.data, opts.data);
+                       "lua regex cache miss for match regex \"%s\" "
+                       "with options \"%s\"", pat.data, opts.data);
 
         if (lmcf->regex_cache_entries >= lmcf->regex_cache_max_entries) {
 
             if (lmcf->regex_cache_entries == lmcf->regex_cache_max_entries) {
                 ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                        "lua exceeding regex cache max entries (%i)",
-                        lmcf->regex_cache_max_entries);
+                              "lua exceeding regex cache max entries (%i)",
+                              lmcf->regex_cache_max_entries);
 
                 lmcf->regex_cache_entries++;
             }
@@ -637,12 +678,12 @@ ngx_http_lua_ngx_re_gmatch(lua_State *L)
     re_comp.pool = pool;
 
     ngx_log_debug5(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-            "lua compiling gmatch regex \"%s\" with options \"%s\" "
-            "(compile once: %d) (dfa mode: %d) (jit mode: %d)",
-            pat.data, opts.data,
-            (flags & NGX_LUA_RE_COMPILE_ONCE) != 0,
-            (flags & NGX_LUA_RE_MODE_DFA) != 0,
-            (flags & NGX_LUA_RE_MODE_JIT) != 0);
+                   "lua compiling gmatch regex \"%s\" with options \"%s\" "
+                   "(compile once: %d) (dfa mode: %d) (jit mode: %d)",
+                   pat.data, opts.data,
+                   (flags & NGX_LUA_RE_COMPILE_ONCE) != 0,
+                   (flags & NGX_LUA_RE_MODE_DFA) != 0,
+                   (flags & NGX_LUA_RE_MODE_JIT) != 0);
 
     old_pool = ngx_http_lua_pcre_malloc_init(pool);
 
@@ -655,7 +696,7 @@ ngx_http_lua_ngx_re_gmatch(lua_State *L)
 
         re_comp.err.data[re_comp.err.len] = '\0';
         msg = lua_pushfstring(L, "failed to compile regex \"%s\": %s",
-                pat.data, re_comp.err.data);
+                              pat.data, re_comp.err.data);
 
         return luaL_argerror(L, 2, msg);
     }
@@ -675,8 +716,8 @@ ngx_http_lua_ngx_re_gmatch(lua_State *L)
 
         if (msg != NULL) {
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "pcre_study failed with PCRE_STUDY_JIT_COMPILE: %s (%p)",
-                msg, sd);
+                           "pcre_study failed with PCRE_STUDY_JIT_COMPILE: "
+                           "%s (%p)", msg, sd);
         }
 
         if (sd != NULL) {
@@ -689,7 +730,7 @@ ngx_http_lua_ngx_re_gmatch(lua_State *L)
             ngx_http_lua_pcre_malloc_done(old_pool);
 
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "pcre JIT compiling result: %d", jitted);
+                           "pcre JIT compiling result: %d", jitted);
         }
 #   endif /* NGX_DEBUG */
 
@@ -706,8 +747,8 @@ ngx_http_lua_ngx_re_gmatch(lua_State *L)
 
         if (msg != NULL) {
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "pcre study failed with PCRE_STUDY_JIT_COMPILE: %s (%p)",
-                msg, sd);
+                           "pcre study failed with PCRE_STUDY_JIT_COMPILE: "
+                           "%s (%p)", msg, sd);
         }
 #   endif /* NGX_DEBUG */
     }
@@ -716,8 +757,8 @@ ngx_http_lua_ngx_re_gmatch(lua_State *L)
 
     if (flags & NGX_LUA_RE_MODE_JIT) {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "your pcre build does not have JIT support and "
-                "the \"j\" regex option is ignored");
+                       "your pcre build does not have JIT support and "
+                       "the \"j\" regex option is ignored");
     }
 
 #endif /* LUA_HAVE_PCRE_JIT */
@@ -741,9 +782,9 @@ ngx_http_lua_ngx_re_gmatch(lua_State *L)
     if (flags & NGX_LUA_RE_COMPILE_ONCE) {
 
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "lua saving compiled regex (%d captures) into the cache "
-                "(entries %i)", re_comp.captures,
-                lmcf ? lmcf->regex_cache_entries : 0);
+                       "lua saving compiled regex (%d captures) into the cache "
+                       "(entries %i)", re_comp.captures,
+                       lmcf ? lmcf->regex_cache_entries : 0);
 
         re = ngx_palloc(pool, sizeof(ngx_http_lua_regex_t));
         if (re == NULL) {
@@ -751,7 +792,7 @@ ngx_http_lua_ngx_re_gmatch(lua_State *L)
         }
 
         dd("saving regex %p, ncaptures %d,  captures %p", re_comp.regex,
-                re_comp.captures, cap);
+           re_comp.captures, cap);
 
         re->regex = re_comp.regex;
         re->regex_sd = sd;
@@ -838,6 +879,8 @@ ngx_http_lua_ngx_re_gmatch_iterator(lua_State *L)
     ngx_str_t                    subj;
     int                          offset;
     const char                  *msg = NULL;
+    int                          name_entry_size, name_count;
+    u_char                      *name_table;
 
     /* upvalues in order: subj ctx offset */
 
@@ -865,10 +908,33 @@ ngx_http_lua_ngx_re_gmatch_iterator(lua_State *L)
 
     if (r != ctx->request || r->pool != ctx->request->pool) {
         return luaL_error(L, "attempt to use ngx.re.gmatch iterator in a "
-                "request that did not create it");
+                          "request that did not create it");
     }
 
     dd("regex exec...");
+
+    if (pcre_fullinfo(ctx->regex, NULL, PCRE_INFO_NAMECOUNT,
+                      &name_count) != 0)
+    {
+        msg = "cannot acquire named subpattern count";
+        goto error;
+    }
+
+    if (name_count > 0) {
+        if (pcre_fullinfo(ctx->regex, NULL, PCRE_INFO_NAMEENTRYSIZE,
+                          &name_entry_size) != 0)
+        {
+            msg = "cannot acquire named subpattern entry size";
+            goto error;
+        }
+
+        if (pcre_fullinfo(ctx->regex, NULL, PCRE_INFO_NAMETABLE,
+                          &name_table) != 0)
+        {
+            msg = "cannot acquire named subpattern table";
+            goto error;
+        }
+    }
 
     if (ctx->flags & NGX_LUA_RE_MODE_DFA) {
 
@@ -877,8 +943,8 @@ ngx_http_lua_ngx_re_gmatch_iterator(lua_State *L)
         int ws[NGX_LUA_RE_DFA_MODE_WORKSPACE_COUNT];
 
         rc = ngx_http_lua_regex_dfa_exec(ctx->regex, ctx->regex_sd, &subj,
-            offset, cap, ctx->captures_len, ws,
-            NGX_LUA_RE_DFA_MODE_WORKSPACE_COUNT);
+                                         offset, cap, ctx->captures_len, ws,
+                                         sizeof(ws)/sizeof(ws[0]));
 
 #else /* LUA_HAVE_PCRE_DFA */
         msg = "at least pcre 6.0 is required for the DFA mode";
@@ -911,7 +977,7 @@ ngx_http_lua_ngx_re_gmatch_iterator(lua_State *L)
 
     if (rc < 0) {
         msg = lua_pushfstring(L, ngx_regex_exec_n " failed: %d on \"%s\"",
-                (int) rc, subj.data);
+                              (int) rc, subj.data);
         goto error;
     }
 
@@ -935,12 +1001,18 @@ ngx_http_lua_ngx_re_gmatch_iterator(lua_State *L)
 
         } else {
             lua_pushlstring(L, (char *) &subj.data[cap[n]],
-                    cap[n + 1] - cap[n]);
+                            cap[n + 1] - cap[n]);
 
             dd("pushing capture %s at %d", lua_tostring(L, -1), (int) i);
         }
 
         lua_rawseti(L, -2, (int) i);
+    }
+
+    if (name_count > 0) {
+        ngx_http_lua_re_collect_named_captures(L, name_table, name_count,
+                                               name_entry_size, ctx->flags,
+                                               &subj);
     }
 
     offset = cap[1];
@@ -1032,6 +1104,17 @@ ngx_http_lua_ngx_re_parse_opts(lua_State *L, ngx_lua_regex_compile_t *re,
                 re->options |= PCRE_ANCHORED;
                 break;
 
+#if (PCRE_MAJOR > 8) || (PCRE_MAJOR == 8 && PCRE_MINOR >= 12)
+            case 'D':
+                re->options |= PCRE_DUPNAMES;
+                flags |= NGX_LUA_RE_MODE_DUPNAMES;
+                break;
+
+            case 'J':
+                re->options |= PCRE_JAVASCRIPT_COMPAT;
+                break;
+#endif
+
             default:
                 msg = lua_pushfstring(L, "unknown flag \"%c\"", *p);
                 return luaL_argerror(L, narg, msg);
@@ -1094,6 +1177,8 @@ ngx_http_lua_ngx_re_sub_helper(lua_State *L, unsigned global)
     u_char                      *p;
     u_char                       errstr[NGX_MAX_CONF_ERRSTR + 1];
     pcre_extra                  *sd = NULL;
+    int                          name_entry_size, name_count;
+    u_char                      *name_table;
 
     ngx_http_lua_complex_value_t              *ctpl = NULL;
     ngx_http_lua_compile_complex_value_t       ccv;
@@ -1134,7 +1219,7 @@ ngx_http_lua_ngx_re_sub_helper(lua_State *L, unsigned global)
 
         default:
             msg = lua_pushfstring(L, "string, number, or function expected, "
-                    "got %s", lua_typename(L, type));
+                                  "got %s", lua_typename(L, type));
             return luaL_argerror(L, 3, msg);
     }
 
@@ -1188,7 +1273,7 @@ ngx_http_lua_ngx_re_sub_helper(lua_State *L, unsigned global)
         lua_pushvalue(L, -1); /* table key key */
 
         dd("regex cache key: %.*s", (int) (pat.len + sizeof(re_comp.options)),
-                lua_tostring(L, -1));
+           lua_tostring(L, -1));
 
         lua_rawget(L, -3); /* table key re */
         re = lua_touserdata(L, -1);
@@ -1197,14 +1282,15 @@ ngx_http_lua_ngx_re_sub_helper(lua_State *L, unsigned global)
 
         if (re) {
             ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                    "lua regex cache hit for sub regex \"%s\" with options "
-                    "\"%s\" and replace \"%s\"", pat.data, opts.data,
-                    func ? (u_char *) "<func>" : tpl.data);
+                           "lua regex cache hit for sub regex \"%s\" with "
+                           "options \"%s\" and replace \"%s\"",
+                           pat.data, opts.data,
+                           func ? (u_char *) "<func>" : tpl.data);
 
             lua_pop(L, 2);
 
             dd("restoring regex %p, ncaptures %d,  captures %p", re->regex,
-                    re->ncaptures, re->captures);
+               re->ncaptures, re->captures);
 
             re_comp.regex = re->regex;
             sd = re->regex_sd;
@@ -1223,18 +1309,17 @@ ngx_http_lua_ngx_re_sub_helper(lua_State *L, unsigned global)
         }
 
         ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "lua regex cache miss for %ssub regex \"%s\" with options "
-                "\"%s\" and replace \"%s\"",
-                global ? "g" : "",
-                pat.data, opts.data,
-                func ? (u_char *) "<func>" : tpl.data);
+                       "lua regex cache miss for %ssub regex \"%s\" with "
+                       "options \"%s\" and replace \"%s\"",
+                       global ? "g" : "", pat.data, opts.data,
+                       func ? (u_char *) "<func>" : tpl.data);
 
         if (lmcf->regex_cache_entries >= lmcf->regex_cache_max_entries) {
 
             if (lmcf->regex_cache_entries == lmcf->regex_cache_max_entries) {
                 ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                        "lua exceeding regex cache max entries (%i)",
-                        lmcf->regex_cache_max_entries);
+                              "lua exceeding regex cache max entries (%i)",
+                              lmcf->regex_cache_max_entries);
 
                 lmcf->regex_cache_entries++;
             }
@@ -1255,12 +1340,12 @@ ngx_http_lua_ngx_re_sub_helper(lua_State *L, unsigned global)
     dd("compiling regex");
 
     ngx_log_debug6(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-            "lua compiling %ssub regex \"%s\" with options \"%s\" "
-            "(compile once: %d) (dfa mode: %d) (jit mode: %d)",
-            global ? "g" : "", pat.data, opts.data,
-            (flags & NGX_LUA_RE_COMPILE_ONCE) != 0,
-            (flags & NGX_LUA_RE_MODE_DFA) != 0,
-            (flags & NGX_LUA_RE_MODE_JIT) != 0);
+                   "lua compiling %ssub regex \"%s\" with options \"%s\" "
+                   "(compile once: %d) (dfa mode: %d) (jit mode: %d)",
+                   global ? "g" : "", pat.data, opts.data,
+                   (flags & NGX_LUA_RE_COMPILE_ONCE) != 0,
+                   (flags & NGX_LUA_RE_MODE_DFA) != 0,
+                   (flags & NGX_LUA_RE_MODE_JIT) != 0);
 
     old_pool = ngx_http_lua_pcre_malloc_init(pool);
 
@@ -1273,7 +1358,7 @@ ngx_http_lua_ngx_re_sub_helper(lua_State *L, unsigned global)
 
         re_comp.err.data[re_comp.err.len] = '\0';
         msg = lua_pushfstring(L, "failed to compile regex \"%s\": %s",
-                pat.data, re_comp.err.data);
+                              pat.data, re_comp.err.data);
 
         return luaL_argerror(L, 2, msg);
     }
@@ -1293,8 +1378,8 @@ ngx_http_lua_ngx_re_sub_helper(lua_State *L, unsigned global)
 
         if (msg != NULL) {
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "pcre study failed with PCRE_STUDY_JIT_COMPILE: %s (%p)",
-                msg, sd);
+                           "pcre study failed with PCRE_STUDY_JIT_COMPILE: "
+                           "%s (%p)", msg, sd);
         }
 
         if (sd != NULL) {
@@ -1307,7 +1392,7 @@ ngx_http_lua_ngx_re_sub_helper(lua_State *L, unsigned global)
             ngx_http_lua_pcre_malloc_done(old_pool);
 
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "pcre JIT compiling result: %d", jitted);
+                           "pcre JIT compiling result: %d", jitted);
         }
 #   endif /* NGX_DEBUG */
 
@@ -1324,8 +1409,8 @@ ngx_http_lua_ngx_re_sub_helper(lua_State *L, unsigned global)
 
         if (msg != NULL) {
             ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "pcre_study failed with PCRE_STUDY_JIT_COMPILE: %s (%p)",
-                msg, sd);
+                           "pcre_study failed with PCRE_STUDY_JIT_COMPILE: "
+                           "%s (%p)", msg, sd);
         }
 #   endif /* NGX_DEBUG */
     }
@@ -1334,8 +1419,8 @@ ngx_http_lua_ngx_re_sub_helper(lua_State *L, unsigned global)
 
     if (flags & NGX_LUA_RE_MODE_JIT) {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "your pcre build does not have JIT support and "
-                "the \"j\" regex option is ignored");
+                       "your pcre build does not have JIT support and "
+                       "the \"j\" regex option is ignored");
     }
 
 #endif /* LUA_HAVE_PCRE_JIT */
@@ -1403,16 +1488,16 @@ ngx_http_lua_ngx_re_sub_helper(lua_State *L, unsigned global)
             ngx_pfree(pool, re_comp.regex);
 
             return luaL_error(L, "bad template for substitution: \"%s\"",
-                    lua_tostring(L, 3));
+                              lua_tostring(L, 3));
         }
     }
 
     if (flags & NGX_LUA_RE_COMPILE_ONCE) {
 
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                "lua saving compiled sub regex (%d captures) into the cache "
-                "(entries %i)", re_comp.captures,
-                lmcf ? lmcf->regex_cache_entries : 0);
+                       "lua saving compiled sub regex (%d captures) into "
+                       "the cache (entries %i)", re_comp.captures,
+                       lmcf ? lmcf->regex_cache_entries : 0);
 
         re = ngx_palloc(pool, sizeof(ngx_http_lua_regex_t));
         if (re == NULL) {
@@ -1420,7 +1505,7 @@ ngx_http_lua_ngx_re_sub_helper(lua_State *L, unsigned global)
         }
 
         dd("saving regex %p, ncaptures %d,  captures %p", re_comp.regex,
-                re_comp.captures, cap);
+           re_comp.captures, cap);
 
         re->regex = re_comp.regex;
         re->regex_sd = sd;
@@ -1442,6 +1527,29 @@ exec:
     offset = 0;
     cp_offset = 0;
 
+    if (pcre_fullinfo(re_comp.regex, NULL, PCRE_INFO_NAMECOUNT,
+                      &name_count) != 0)
+    {
+        msg = "cannot acquire named subpattern count";
+        goto error;
+    }
+
+    if (name_count > 0) {
+        if (pcre_fullinfo(re_comp.regex, NULL, PCRE_INFO_NAMEENTRYSIZE,
+                          &name_entry_size) != 0)
+        {
+            msg = "cannot acquire named subpattern entry size";
+            goto error;
+        }
+
+        if (pcre_fullinfo(re_comp.regex, NULL, PCRE_INFO_NAMETABLE,
+                          &name_table) != 0)
+        {
+            msg = "cannot acquire named subpattern table";
+            goto error;
+        }
+    }
+
     for (;;) {
         if (flags & NGX_LUA_RE_MODE_DFA) {
 
@@ -1449,7 +1557,8 @@ exec:
 
             int ws[NGX_LUA_RE_DFA_MODE_WORKSPACE_COUNT];
             rc = ngx_http_lua_regex_dfa_exec(re_comp.regex, sd, &subj,
-                offset, cap, ovecsize, ws, NGX_LUA_RE_DFA_MODE_WORKSPACE_COUNT);
+                                             offset, cap, ovecsize, ws,
+                                             sizeof(ws)/sizeof(ws[0]));
 
 #else /* LUA_HAVE_PCRE_DFA */
 
@@ -1460,7 +1569,7 @@ exec:
 
         } else {
             rc = ngx_http_lua_regex_exec(re_comp.regex, sd, &subj, offset, cap,
-                    ovecsize);
+                                         ovecsize);
         }
 
         if (rc == NGX_REGEX_NO_MATCHED) {
@@ -1469,7 +1578,8 @@ exec:
 
         if (rc < 0) {
             msg = lua_pushfstring(L, ngx_regex_exec_n " failed: %d on \"%s\" "
-                "using \"%s\"", (int) rc, subj.data, pat.data);
+                                  "using \"%s\"", (int) rc, subj.data,
+                                  pat.data);
             goto error;
         }
 
@@ -1503,13 +1613,20 @@ exec:
 
                 } else {
                     lua_pushlstring(L, (char *) &subj.data[cap[n]],
-                            cap[n + 1] - cap[n]);
+                                    cap[n + 1] - cap[n]);
 
                     dd("pushing capture %s at %d", lua_tostring(L, -1),
-                            (int) i);
+                       (int) i);
                 }
 
                 lua_rawseti(L, -2, (int) i);
+            }
+
+            if (name_count > 0) {
+                ngx_http_lua_re_collect_named_captures(L, name_table,
+                                                       name_count,
+                                                       name_entry_size,
+                                                       flags, &subj);
             }
 
             dd("stack size at call: %d", lua_gettop(L));
@@ -1524,15 +1641,16 @@ exec:
 
                 default:
                     msg = lua_pushfstring(L, "string or number expected to be "
-                            "returned by the replace function, got %s",
-                            lua_typename(L, type));
+                                          "returned by the replace "
+                                          "function, got %s",
+                                          lua_typename(L, type));
                     return luaL_argerror(L, 3, msg);
             }
 
             lua_insert(L, 1);
 
             luaL_addlstring(&luabuf, (char *) &subj.data[cp_offset],
-                    cap[0] - cp_offset);
+                            cap[0] - cp_offset);
 
             luaL_addlstring(&luabuf, (char *) tpl.data, tpl.len);
 
@@ -1559,7 +1677,7 @@ exec:
 
         if (rc != NGX_OK) {
             msg = lua_pushfstring(L, "failed to eval the template for "
-                "replacement: \"%s\"", tpl.data);
+                                  "replacement: \"%s\"", tpl.data);
             goto error;
         }
 
@@ -1586,10 +1704,10 @@ exec:
     } else {
         if (offset < (int) subj.len) {
             dd("adding trailer: %s (len %d)", &subj.data[offset],
-                    (int) (subj.len - offset));
+               (int) (subj.len - offset));
 
             luaL_addlstring(&luabuf, (char *) &subj.data[offset],
-                    subj.len - offset);
+                            subj.len - offset);
         }
 
         luaL_pushresult(&luabuf);
@@ -1700,15 +1818,16 @@ ngx_lua_regex_compile(ngx_lua_regex_compile_t *rc)
     if (re == NULL) {
         if ((size_t) erroff == rc->pattern.len) {
            rc->err.len = ngx_snprintf(rc->err.data, rc->err.len,
-                              "pcre_compile() failed: %s in \"%V\"",
-                               errstr, &rc->pattern)
-                      - rc->err.data;
+                                      "pcre_compile() failed: %s in \"%V\"",
+                                      errstr, &rc->pattern)
+                         - rc->err.data;
 
         } else {
            rc->err.len = ngx_snprintf(rc->err.data, rc->err.len,
-                              "pcre_compile() failed: %s in \"%V\" at \"%s\"",
-                               errstr, &rc->pattern, rc->pattern.data + erroff)
-                      - rc->err.data;
+                                      "pcre_compile() failed: %s in \"%V\" "
+                                      "at \"%s\"", errstr, &rc->pattern,
+                                      rc->pattern.data + erroff)
+                         - rc->err.data;
         }
 
         return NGX_ERROR;
@@ -1773,5 +1892,50 @@ ngx_http_lua_ngx_re_gmatch_gc(lua_State *L)
 }
 
 
+static void
+ngx_http_lua_re_collect_named_captures(lua_State *L, u_char *name_table,
+    int name_count, int name_entry_size, unsigned flags, ngx_str_t *subj)
+{
+    int              i, n;
+    size_t           len;
+    u_char          *name_entry;
+    char            *name;
+
+    for (i = 0; i < name_count; i++) {
+
+        name_entry = &name_table[i * name_entry_size];
+        n = (name_entry[0] << 8) | name_entry[1];
+        name = (char *) &name_entry[2];
+
+        if (flags & NGX_LUA_RE_MODE_DUPNAMES) {
+            lua_getfield(L, -1, name);
+
+            if (lua_isnil(L, -1)) {
+                lua_pop(L, 1);
+
+                /* assuming named submatches are usually unique */
+                lua_createtable(L, 1 /* narr */, 0 /* nrec */);
+                lua_pushstring(L, name);
+                lua_pushvalue(L, -2); /* big_tb small_tb key small_tb */
+                lua_rawset(L, -4); /* big_tb small_tb */
+            }
+
+            len = lua_objlen(L, -1);
+
+            lua_rawgeti(L, -2, n);
+            lua_rawseti(L, -2, (int) len + 1);
+
+            /* pop the m[name] array we pulled in */
+            lua_pop(L, 1);
+
+        } else {
+            lua_pushstring(L, name);
+            lua_rawgeti(L, -2, n);
+            lua_rawset(L, -3);
+        }
+    }
+}
+
 #endif /* NGX_PCRE */
 
+/* vi:set ft=c ts=4 sw=4 et fdm=marker: */

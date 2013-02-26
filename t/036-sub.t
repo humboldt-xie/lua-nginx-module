@@ -9,7 +9,7 @@ use Test::Nginx::Socket;
 
 repeat_each(2);
 
-plan tests => repeat_each() * (blocks() * 2);
+plan tests => repeat_each() * (blocks() * 2 + 1);
 
 #no_diff();
 no_long_string();
@@ -365,4 +365,83 @@ nil
     GET /re
 --- response_body
 howdy, world
+
+
+
+=== TEST 20: matched and with variables w/o using named patterns in sub
+--- config
+    location /re {
+        content_by_lua '
+            local s, n = ngx.re.sub("a b c d", "(?<first>b) (?<second>c)", "[$0] [$1] [$2] [$3] [$134]")
+            ngx.say(s)
+            ngx.say(n)
+        ';
+    }
+--- request
+    GET /re
+--- response_body
+a [b c] [b] [c] [] [] d
+1
+
+
+
+=== TEST 21: matched and with variables using named patterns in func
+--- config
+    error_log /tmp/nginx_error debug;
+    location /re {
+        content_by_lua '
+            local repl = function (m)
+                return "[" .. m[0] .. "] [" .. m["first"] .. "] [" .. m[2] .. "]"
+            end
+
+            local s, n = ngx.re.sub("a b c d", "(?<first>b) (?<second>c)", repl)
+            ngx.say(s)
+            ngx.say(n)
+        ';
+    }
+--- request
+    GET /re
+--- response_body
+a [b c] [b] [c] d
+1
+
+
+
+=== TEST 22: matched and with variables w/ using named patterns in sub
+This is still a TODO
+--- SKIP
+--- config
+    location /re {
+        content_by_lua '
+            local s, n = ngx.re.sub("a b c d", "(?<first>b) (?<second>c)", "[$0] [${first}] [${second}] [$3] [$134]")
+            ngx.say(s)
+            ngx.say(n)
+        ';
+    }
+--- request
+    GET /re
+--- response_body
+a [b c] [b] [c] [] [] d
+1
+--- no_error_log
+[error]
+
+
+
+=== TEST 23: $0 without parens
+--- config
+    location /re {
+        content_by_lua '
+            local s, n = ngx.re.sub("a b c d", [[\w]], "[$0]")
+            ngx.say(s)
+            ngx.say(n)
+        ';
+    }
+--- request
+    GET /re
+--- response_body
+[a] b c d
+1
+--- no_error_log
+[error]
 

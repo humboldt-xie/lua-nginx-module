@@ -8,9 +8,9 @@ Status
     This module is under active development and is production ready.
 
 Version
-    This document describes ngx_lua v0.7.13
-    (<https://github.com/chaoslawful/lua-nginx-module/tags>) released on 3
-    January 2013.
+    This document describes ngx_lua v0.7.16
+    (<https://github.com/chaoslawful/lua-nginx-module/tags>) released on 22
+    February 2013.
 
 Synopsis
         # set search paths for pure Lua external libraries (';;' is the default path):
@@ -871,10 +871,10 @@ Directives
     and the "eof" flag indicating the end of the response body data stream
     is passed via ngx.arg[2] (as a Lua boolean value).
 
-    Behind the scene, the "eof" flag is just the "last_buf" flag of the
-    nginx chain link buffers. And in the context of an Nginx subrequest,
-    there is no "eof" flag at all, due to the underlying limitation in the
-    Nginx core.
+    Behind the scene, the "eof" flag is just the "last_buf" (for main
+    requests) or "last_in_chain" (for subrequests) flag of the Nginx chain
+    link buffers. (Before the "v0.7.14" release, the "eof" flag does not
+    work at all in subrequests.)
 
     The output data stream can be aborted immediately by running the
     following Lua statement:
@@ -1255,13 +1255,15 @@ Directives
 
     context: *http, server, location, location-if*
 
-    Enables or disables response caching for HTTP 1.0 (or older) requests.
-    This buffering mechanism is mainly used for HTTP 1.0 keep-alive which
-    replies on a proper "Content-Length" response header.
+    Enables or disables automatic response buffering for HTTP 1.0 (or older)
+    requests. This buffering mechanism is mainly used for HTTP 1.0
+    keep-alive which replies on a proper "Content-Length" response header.
 
     If the Lua code explicitly sets a "Content-Length" response header
     before sending the headers (either explicitly via ngx.send_headers or
-    implicitly via the first ngx.say or ngx.print call).
+    implicitly via the first ngx.say or ngx.print call), then the HTTP 1.0
+    response buffering will be disabled even when this directive is turned
+    on.
 
     To output very large response data in a streaming fashion (via the
     ngx.flush call, for example), this directive MUST be turned off to
@@ -2361,7 +2363,7 @@ Nginx API for Lua
     Removing the "max_args" cap is strongly discouraged.
 
   ngx.req.get_post_args
-    syntax: *ngx.req.get_post_args(max_args?)*
+    syntax: *args, err = ngx.req.get_post_args(max_args?)*
 
     context: *rewrite_by_lua*, access_by_lua*, content_by_lua*,
     header_filter_by_lua*, body_filter_by_lua, log_by_lua**
@@ -2369,12 +2371,16 @@ Nginx API for Lua
     Returns a Lua table holding all the current request POST query arguments
     (of the MIME type "application/x-www-form-urlencoded"). Call
     ngx.req.read_body to read the request body first or turn on the
-    lua_need_request_body directive to avoid Lua exception errors.
+    lua_need_request_body directive to avoid errors.
 
         location = /test {
             content_by_lua '
                 ngx.req.read_body()
                 local args = ngx.req.get_post_args()
+                if not args then
+                    ngx.say("failed to get post args: ", err)
+                    return
+                end
                 for key, val in pairs(args) do
                     if type(val) == "table" then
                         ngx.say(key, ": ", table.concat(val, ", "))
@@ -2689,17 +2695,6 @@ Nginx API for Lua
     body's memory will be freed or the disk file will be cleaned up
     immediately, respectively.
 
-    This function requires patching the Nginx core to function properly
-    because the Nginx core does not allow modifying request bodies by the
-    current design. Here is a patch for Nginx 1.0.11:
-    nginx-1.0.11-allow_request_body_updating.patch
-    (<https://github.com/agentzh/ngx_openresty/blob/master/patches/nginx-1.0
-    .11-allow_request_body_updating.patch>), and this patch should be
-    applied cleanly to other releases of Nginx as well.
-
-    This patch has already been applied to ngx_openresty
-    (<http://openresty.org/>) 1.0.8.17 and above.
-
     This function was first introduced in the "v0.3.1rc18" release.
 
     See also ngx.req.set_body_file.
@@ -2726,15 +2721,6 @@ Nginx API for Lua
     read into memory or buffered into a disk file, then the old request
     body's memory will be freed or the disk file will be cleaned up
     immediately, respectively.
-
-    This function requires patching the Nginx core to function properly
-    because the Nginx core does not allow modifying request bodies by the
-    current design. Here is a patch for Nginx 1.0.9:
-    nginx-1.0.9-allow_request_body_updating.patch
-    (<https://github.com/agentzh/ngx_openresty/blob/master/patches/nginx-1.0
-    .9-allow_request_body_updating.patch>), and this patch should be applied
-    cleanly to other releases of Nginx as well. This patch has already been
-    applied to ngx_openresty (<http://openresty.org/>) 1.0.8.17 and above.
 
     This function was first introduced in the "v0.3.1rc18" release.
 
@@ -3379,6 +3365,15 @@ Nginx API for Lua
 
     This function was first introduced in the "v0.5.0rc6".
 
+  ngx.quote_sql_str
+    syntax: *quoted_value = ngx.quote_sql_str(raw_value)*
+
+    context: *set_by_lua*, rewrite_by_lua*, access_by_lua*, content_by_lua*,
+    header_filter_by_lua*, body_filter_by_lua*, log_by_lua**
+
+    Returns a quoted SQL string literal according to the MySQL quoting
+    rules.
+
   ngx.today
     syntax: *str = ngx.today()*
 
@@ -3528,13 +3523,25 @@ Nginx API for Lua
         -- m[0] == "1234"
         -- m[1] == "1"
 
-    Unmatched sub-patterns will have "nil" values in their "captures" table
+    Named captures are also supported since the "v0.7.14" release and are
+    returned in the same Lua table as key-value pairs as the numbered
+    captures.
+
+        local m = ngx.re.match("hello, 1234", "([0-9])(?<remaining>[0-9]+)")
+        -- m[0] == "1234"
+        -- m[1] == "1"
+        -- m[2] == "234"
+        -- m["remaining"] == "234"
+
+    Unmatched subpatterns will have "nil" values in their "captures" table
     fields.
 
-        local m = ngx.re.match("hello, world", "(world)|(hello)")
+        local m = ngx.re.match("hello, world", "(world)|(hello)|(?<named>howdy)")
         -- m[0] == "hello"
         -- m[1] == nil
         -- m[2] == "hello"
+        -- m[3] == nil
+        -- m["named"] == nil
 
     Specify "options" to control how the match operation will be performed.
     The following option characters are supported:
@@ -3545,12 +3552,26 @@ Nginx API for Lua
                       this requires PCRE 6.0+ or else a Lua exception will be thrown.
                       first introduced in ngx_lua v0.3.1rc30.
 
+        D             enable duplicate named pattern support. This allows named
+                      subpattern names to be repeated, returning the captures in
+                      an array-like Lua table. for example,
+                        local m = ngx.re.match("hello, world",
+                                               "(?<named>\w+), (?<named>\w+)",
+                                               "D")
+                        -- m["named"] == {"hello", "world"}
+                      this option was first introduced in the v0.7.14 release.
+                      this option requires at least PCRE 8.12.
+
         i             case insensitive mode (similar to Perl's /i modifier)
 
         j             enable PCRE JIT compilation, this requires PCRE 8.21+ which
                       must be built with the --enable-jit option. for optimum performance,
                       this option should always be used together with the 'o' option.
                       first introduced in ngx_lua v0.3.1rc30.
+
+        J             enable the PCRE Javascript compatible mode. this option was
+                      first introduced in the v0.7.14 release. this option requires
+                      at least PCRE 8.12.
 
         m             multi-line mode (similar to Perl's /m modifier)
 
@@ -5296,17 +5317,6 @@ Known Issues
     appears to affect Mac OS X.
 
   Lua Coroutine Yielding/Resuming
-    *   As the module's predefined Nginx I/O API uses the coroutine
-        yielding/resuming mechanism, user code should not call any Lua
-        modules that use the Lua coroutine mechanism in order to prevent
-        conflicts with the module's predefined Nginx API methods such as
-        ngx.location.capture (Actually, coroutine modules have been masked
-        off in content_by_lua directives and others). This limitation is
-        significant and work is ongoing on an alternative coroutine
-        implementation that can fit into the Nginx event model to address
-        this. When this is done, it will be possible to use the Lua
-        coroutine mechanism freely as it is in standard Lua implementations.
-
     *   Lua's "dofile" builtin is implemented as a C function in both Lua
         5.1 and LuaJIT 2.0 and when ngx.location.capture is called,
         ngx.exec, ngx.exit or ngx.req.read_body or similar in the file to be
@@ -5322,10 +5332,11 @@ Known Issues
         ngx.redirect, ngx.exec, and ngx.exit cannot be used within the
         context of a Lua pcall()
         (<http://www.lua.org/manual/5.1/manual.html#pdf-pcall>) or xpcall()
-        (<http://www.lua.org/manual/5.1/manual.html#pdf-xpcall>) when the
-        standard Lua 5.1 interpreter is used and the "attempt to yield
-        across metamethod/C-call boundary" error will be produced. Please
-        use LuaJIT 2.0, which supports a fully resumable VM, to avoid this.
+        (<http://www.lua.org/manual/5.1/manual.html#pdf-xpcall>) or even the
+        first line of the "for ... in ..." statement when the standard Lua
+        5.1 interpreter is used and the "attempt to yield across
+        metamethod/C-call boundary" error will be produced. Please use
+        LuaJIT 2.0, which supports a fully resumable VM, to avoid this.
 
   Lua Variable Scope
     Care must be taken when importing modules and this form should be used:
@@ -5515,11 +5526,11 @@ Typical Uses
     equivalents.
 
 Nginx Compatibility
-    The module is compatible with the following versions of Nginx:
+    The latest module is compatible with the following versions of Nginx:
 
-    *   1.3.x (last tested: 1.3.7)
+    *   1.3.x (last tested: 1.3.11)
 
-    *   1.2.x (last tested: 1.2.6)
+    *   1.2.x (last tested: 1.2.7)
 
     *   1.1.x (last tested: 1.1.5)
 
@@ -5560,9 +5571,9 @@ Installation
 
     Build the source with this module:
 
-        wget 'http://nginx.org/download/nginx-1.2.6.tar.gz'
-        tar -xzvf nginx-1.2.6.tar.gz
-        cd nginx-1.2.6/
+        wget 'http://nginx.org/download/nginx-1.2.7.tar.gz'
+        tar -xzvf nginx-1.2.7.tar.gz
+        cd nginx-1.2.7/
 
         # tell nginx's build system where to find LuaJIT:
         export LUAJIT_LIB=/path/to/luajit/lib
@@ -5744,7 +5755,7 @@ Copyright and License
     <chaoslawful@gmail.com>.
 
     Copyright (C) 2009-2013, by Yichun "agentzh" Zhang (章亦春)
-    <agentzh@gmail.com>.
+    <agentzh@gmail.com>, CloudFlare Inc.
 
     All rights reserved.
 
